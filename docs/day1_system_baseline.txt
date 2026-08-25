@@ -1,0 +1,37 @@
+PROJECT: 5G Autonomous Rover
+DATE: 2026-08-25
+
+PLATFORM
+Jetson: Orin Nano Engineering Reference Developer Kit
+Architecture: aarch64
+CPU: 6 x Cortex-A78AE
+RAM: ~7.6 GB
+
+OS
+Ubuntu: 22.04.5 LTS
+Kernel: 5.15.148-tegra
+L4T: R36.4.7
+
+NVIDIA
+CUDA: 12.6.85
+TensorRT: 10.3.0.30
+trtexec: /usr/src/tensorrt/bin/trtexec
+
+ROS
+ROS 2: Humble
+
+DOCKER
+Docker: 29.3.0
+NVIDIA Container Toolkit: 1.19.0
+
+STORAGE
+NVMe: WD Blue SN5000 1TB
+Available at baseline: ~561 GB
+
+GPU
+Baseline telemetry: see Day-1 tegrastats log
+
+NOTES
+Existing Docker images belong to previous project.
+Do not delete/prune until archived/verified.
+

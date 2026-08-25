@@ -1,0 +1,29 @@
+# Mission data
+missions/
+
+# Raw logs / ROS bags
+logs/
+*.bag
+*.db3
+
+# Model weights / engines
+models/
+
+# Build artifacts
+ros_ws/build/
+ros_ws/install/
+ros_ws/log/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Docker local overrides
+.env
+docker-compose.override.yml
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
