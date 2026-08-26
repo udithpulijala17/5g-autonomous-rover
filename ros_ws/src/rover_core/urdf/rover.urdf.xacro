@@ -1,0 +1,104 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro"
+       name="five_g_rover">
+
+  <!-- ========================================================= -->
+  <!--                  BASE FRAME                               -->
+  <!-- ========================================================= -->
+
+  <link name="base_link"/>
+
+
+  <!-- ========================================================= -->
+  <!--                  SENSOR PARAMETERS                        -->
+  <!-- Replace the TODO values with real measurements            -->
+  <!-- Units: meters, angles in radians                          -->
+  <!-- ========================================================= -->
+
+  <!-- Camera -->
+  <xacro:property name="camera_x" value="0.0"/>
+  <xacro:property name="camera_y" value="0.0"/>
+  <xacro:property name="camera_z" value="0.0"/>
+
+  <xacro:property name="camera_roll"  value="0.0"/>
+  <xacro:property name="camera_pitch" value="0.0"/>
+  <xacro:property name="camera_yaw"   value="0.0"/>
+
+
+  <!-- LiDAR -->
+  <xacro:property name="lidar_x" value="0.0"/>
+  <xacro:property name="lidar_y" value="0.0"/>
+  <xacro:property name="lidar_z" value="0.0"/>
+
+  <xacro:property name="lidar_roll"  value="0.0"/>
+  <xacro:property name="lidar_pitch" value="0.0"/>
+  <xacro:property name="lidar_yaw"   value="0.0"/>
+
+
+  <!-- IMU -->
+  <xacro:property name="imu_x" value="0.0"/>
+  <xacro:property name="imu_y" value="0.0"/>
+  <xacro:property name="imu_z" value="0.0"/>
+
+  <xacro:property name="imu_roll"  value="0.0"/>
+  <xacro:property name="imu_pitch" value="0.0"/>
+  <xacro:property name="imu_yaw"   value="0.0"/>
+
+
+  <!-- ========================================================= -->
+  <!--                  CAMERA FRAME                              -->
+  <!-- ========================================================= -->
+
+  <link name="camera_link"/>
+
+  <joint name="base_to_camera"
+         type="fixed">
+
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+
+    <origin
+      xyz="${camera_x} ${camera_y} ${camera_z}"
+      rpy="${camera_roll} ${camera_pitch} ${camera_yaw}"/>
+
+  </joint>
+
+
+  <!-- ========================================================= -->
+  <!--                  LIDAR FRAME                               -->
+  <!-- ========================================================= -->
+
+  <link name="lidar_link"/>
+
+  <joint name="base_to_lidar"
+         type="fixed">
+
+    <parent link="base_link"/>
+    <child link="lidar_link"/>
+
+    <origin
+      xyz="${lidar_x} ${lidar_y} ${lidar_z}"
+      rpy="${lidar_roll} ${lidar_pitch} ${lidar_yaw}"/>
+
+  </joint>
+
+
+  <!-- ========================================================= -->
+  <!--                  IMU FRAME                                 -->
+  <!-- ========================================================= -->
+
+  <link name="imu_link"/>
+
+  <joint name="base_to_imu"
+         type="fixed">
+
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+
+    <origin
+      xyz="${imu_x} ${imu_y} ${imu_z}"
+      rpy="${imu_roll} ${imu_pitch} ${imu_yaw}"/>
+
+  </joint>
+
+</robot>

@@ -1,6 +1,17 @@
 # Mission data
 missions/
 
+# ROS 2 generated workspace files
+ros_ws/build/
+ros_ws/install/
+ros_ws/log/
+ros_ws/*.gv
+ros_ws/*.pdf
+
+# Python packaging/build artifacts
+**/*.egg-info/
+__pycache__/
+*.pyc
 # Raw logs / ROS bags
 logs/
 *.bag
