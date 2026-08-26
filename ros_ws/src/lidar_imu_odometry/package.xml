@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>lidar_imu_odometry</name>
+  <version>0.0.1</version>
+  <description>
+    2D LiDAR and IMU odometry for the RPLIDAR S3 and WT901.
+  </description>
+
+  <maintainer email="udithpulijala17@gmail.com">nvidia</maintainer>
+
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>geometry_msgs</depend>
+
+  <build_depend>libpcl-dev</build_depend>
+  <exec_depend>libpcl-dev</exec_depend>
+
+  <build_depend>libeigen3-dev</build_depend>
+  <exec_depend>libeigen3-dev</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -4,6 +4,7 @@ import asyncio
 import math
 import queue
 import threading
+import time
 from dataclasses import dataclass
 
 from bleak import BleakClient, BleakScanner
@@ -33,7 +34,32 @@ BLE_RECONNECT_DELAY = 3.0
 
 
 # ============================================================
-# PARSED IMU DATA
+# IMU CALIBRATION / FILTERING
+# ============================================================
+
+# Number of stationary gyro samples used for startup bias calibration.
+CALIBRATION_SAMPLES = 300
+
+# Maximum time allowed for startup calibration.
+CALIBRATION_TIMEOUT = 8.0
+
+# Gyro low-pass filter coefficient.
+# Smaller = smoother, larger = faster response.
+GYRO_ALPHA = 0.20
+
+# Samples with gyro magnitude above this threshold are ignored
+# during startup calibration.
+# Unit: rad/s
+STATIONARY_GYRO_THRESHOLD = 0.08
+
+# Reject integration steps larger than this.
+# This prevents a BLE scheduling gap from creating a false
+# large yaw jump.
+MAX_DT = 0.20
+
+
+# ============================================================
+# PARSED WT901 DATA
 # ============================================================
 
 @dataclass
@@ -52,11 +78,12 @@ class WT901Data:
 
 
 # ============================================================
-# WT901 PARSER
+# LOW-LEVEL WT901 DECODING
 # ============================================================
 
 def int16_le(lo: int, hi: int) -> int:
     """Decode signed little-endian int16."""
+
     value = lo | (hi << 8)
 
     if value & 0x8000:
@@ -69,14 +96,14 @@ def parse_0x61(packet: bytes) -> WT901Data:
     """
     Parse a WT901 0x61 frame.
 
-    Expected:
-        20 bytes
-        55 61 + 9 signed int16 values
+    Expected 20-byte frame:
 
-    Order:
+        55 61
         AX AY AZ
         GX GY GZ
-        Roll Pitch Yaw
+        ROLL PITCH YAW
+
+    All nine values are signed int16.
     """
 
     if len(packet) != 20:
@@ -95,17 +122,30 @@ def parse_0x61(packet: bytes) -> WT901Data:
         for i in range(2, 20, 2)
     ]
 
-    ax, ay, az, gx, gy, gz, roll, pitch, yaw = values
+    (
+        ax,
+        ay,
+        az,
+        gx,
+        gy,
+        gz,
+        roll,
+        pitch,
+        yaw,
+    ) = values
 
     return WT901Data(
+        # Accelerometer: ±16 g
         ax_g=ax / 32768.0 * 16.0,
         ay_g=ay / 32768.0 * 16.0,
         az_g=az / 32768.0 * 16.0,
 
+        # Gyroscope: ±2000 deg/s
         gx_dps=gx / 32768.0 * 2000.0,
         gy_dps=gy / 32768.0 * 2000.0,
         gz_dps=gz / 32768.0 * 2000.0,
 
+        # Euler angles
         roll_deg=roll / 32768.0 * 180.0,
         pitch_deg=pitch / 32768.0 * 180.0,
         yaw_deg=yaw / 32768.0 * 180.0,
@@ -113,7 +153,7 @@ def parse_0x61(packet: bytes) -> WT901Data:
 
 
 # ============================================================
-# EULER → QUATERNION
+# EULER -> QUATERNION
 # ============================================================
 
 def euler_to_quaternion(
@@ -158,6 +198,12 @@ def euler_to_quaternion(
     return x, y, z, w
 
 
+def normalize_angle_deg(angle: float) -> float:
+    """Normalize angle to [-180, 180)."""
+
+    return (angle + 180.0) % 360.0 - 180.0
+
+
 # ============================================================
 # ROS 2 NODE
 # ============================================================
@@ -179,19 +225,61 @@ class WT901ImuNode(Node):
         )
 
         # ----------------------------------------------------
-        # Queue between BLE thread and ROS thread
+        # BLE -> ROS queue
         # ----------------------------------------------------
 
         self.data_queue: queue.Queue[WT901Data] = queue.Queue()
 
         # ----------------------------------------------------
-        # Shutdown control
+        # Shutdown
         # ----------------------------------------------------
 
         self.shutdown_event = threading.Event()
 
         # ----------------------------------------------------
-        # ROS timer drains BLE data queue
+        # Startup gyro calibration
+        # ----------------------------------------------------
+
+        self.calibrating = True
+        self.calibration_started = time.monotonic()
+
+        self.calibration_count = 0
+
+        self.gx_bias_dps = 0.0
+        self.gy_bias_dps = 0.0
+        self.gz_bias_dps = 0.0
+
+        self.gx_bias_sum = 0.0
+        self.gy_bias_sum = 0.0
+        self.gz_bias_sum = 0.0
+
+        # ----------------------------------------------------
+        # Filter state
+        # ----------------------------------------------------
+
+        self.gx_filtered = 0.0
+        self.gy_filtered = 0.0
+        self.gz_filtered = 0.0
+
+        self.filter_initialized = False
+
+        # ----------------------------------------------------
+        # Integrated yaw
+        #
+        # IMPORTANT:
+        # We intentionally DO NOT use the WT901's reported
+        # magnetic/AHRS yaw for localization.
+        #
+        # Instead:
+        #
+        # calibrated gyro-Z -> filter -> integrate -> yaw
+        # ----------------------------------------------------
+
+        self.yaw_integrated_deg = 0.0
+        self.last_gyro_time: float | None = None
+
+        # ----------------------------------------------------
+        # ROS publishing timer
         # ----------------------------------------------------
 
         self.publish_timer = self.create_timer(
@@ -200,7 +288,7 @@ class WT901ImuNode(Node):
         )
 
         # ----------------------------------------------------
-        # BLE thread
+        # BLE worker thread
         # ----------------------------------------------------
 
         self.ble_thread = threading.Thread(
@@ -212,9 +300,8 @@ class WT901ImuNode(Node):
         self.ble_thread.start()
 
         self.get_logger().info(
-            "WT901 BLE ROS 2 node initialized."
+            "WT901 stabilized BLE ROS 2 node initialized."
         )
-
 
     # ========================================================
     # BLE THREAD
@@ -236,7 +323,6 @@ class WT901ImuNode(Node):
                     f"BLE thread stopped: {exc}"
                 )
 
-
     async def ble_worker(self) -> None:
 
         while not self.shutdown_event.is_set():
@@ -246,23 +332,26 @@ class WT901ImuNode(Node):
             try:
 
                 # ------------------------------------------------
-                # Discover WT901 by name
+                # Discover
                 # ------------------------------------------------
 
                 self.get_logger().info(
                     f"Scanning for {WT901_NAME}..."
                 )
 
-                device = await BleakScanner.find_device_by_name(
-                    WT901_NAME,
-                    timeout=BLE_SCAN_TIMEOUT,
+                device = (
+                    await BleakScanner.find_device_by_name(
+                        WT901_NAME,
+                        timeout=BLE_SCAN_TIMEOUT,
+                    )
                 )
 
                 if device is None:
 
                     self.get_logger().warning(
                         f"{WT901_NAME} not found. "
-                        f"Retrying in {BLE_RECONNECT_DELAY}s."
+                        f"Retrying in "
+                        f"{BLE_RECONNECT_DELAY}s."
                     )
 
                     await asyncio.sleep(
@@ -320,7 +409,7 @@ class WT901ImuNode(Node):
                         )
 
                 # ------------------------------------------------
-                # Start FFE4 notifications
+                # Enable notifications
                 # ------------------------------------------------
 
                 await client.start_notify(
@@ -333,7 +422,7 @@ class WT901ImuNode(Node):
                 )
 
                 # ------------------------------------------------
-                # Keep BLE connection alive
+                # Keep connection alive
                 # ------------------------------------------------
 
                 while (
@@ -342,10 +431,6 @@ class WT901ImuNode(Node):
                 ):
 
                     await asyncio.sleep(0.5)
-
-                # ------------------------------------------------
-                # Connection lost
-                # ------------------------------------------------
 
                 if not self.shutdown_event.is_set():
 
@@ -370,11 +455,9 @@ class WT901ImuNode(Node):
                         if client.is_connected:
 
                             try:
-
                                 await client.stop_notify(
                                     NOTIFY_UUID
                                 )
-
                             except Exception:
                                 pass
 
@@ -389,6 +472,151 @@ class WT901ImuNode(Node):
                         BLE_RECONNECT_DELAY
                     )
 
+    # ========================================================
+    # GYRO CALIBRATION
+    # ========================================================
+
+    def process_calibration(
+        self,
+        data: WT901Data,
+    ) -> None:
+
+        if not self.calibrating:
+            return
+
+        elapsed = (
+            time.monotonic()
+            - self.calibration_started
+        )
+
+        # ----------------------------------------------------
+        # Timeout
+        # ----------------------------------------------------
+
+        if elapsed > CALIBRATION_TIMEOUT:
+
+            if self.calibration_count == 0:
+
+                self.get_logger().error(
+                    "IMU calibration failed: "
+                    "no valid stationary samples."
+                )
+
+                return
+
+            self.finish_calibration()
+
+            return
+
+        # ----------------------------------------------------
+        # Convert deg/s -> rad/s for stationary test
+        # ----------------------------------------------------
+
+        d2r = math.pi / 180.0
+
+        gx = data.gx_dps * d2r
+        gy = data.gy_dps * d2r
+        gz = data.gz_dps * d2r
+
+        # ----------------------------------------------------
+        # Ignore samples where the rover is moving
+        # ----------------------------------------------------
+
+        if (
+            abs(gx) > STATIONARY_GYRO_THRESHOLD
+            or abs(gy) > STATIONARY_GYRO_THRESHOLD
+            or abs(gz) > STATIONARY_GYRO_THRESHOLD
+        ):
+
+            return
+
+        # ----------------------------------------------------
+        # Accumulate bias
+        # ----------------------------------------------------
+
+        self.gx_bias_sum += data.gx_dps
+        self.gy_bias_sum += data.gy_dps
+        self.gz_bias_sum += data.gz_dps
+
+        self.calibration_count += 1
+
+        # ----------------------------------------------------
+        # Complete calibration
+        # ----------------------------------------------------
+
+        if self.calibration_count >= CALIBRATION_SAMPLES:
+
+            self.finish_calibration()
+
+    def finish_calibration(self) -> None:
+
+        if self.calibration_count <= 0:
+
+            self.get_logger().error(
+                "Unable to calculate gyro bias."
+            )
+
+            return
+
+        n = float(self.calibration_count)
+
+        self.gx_bias_dps = (
+            self.gx_bias_sum / n
+        )
+
+        self.gy_bias_dps = (
+            self.gy_bias_sum / n
+        )
+
+        self.gz_bias_dps = (
+            self.gz_bias_sum / n
+        )
+
+        self.calibrating = False
+
+        # Reset yaw integration after calibration.
+        self.yaw_integrated_deg = 0.0
+        self.last_gyro_time = None
+
+        # Reset filter so the first post-calibration
+        # sample initializes it cleanly.
+        self.filter_initialized = False
+
+        self.get_logger().info(
+            "================================================"
+        )
+
+        self.get_logger().info(
+            "WT901 gyro calibration complete."
+        )
+
+        self.get_logger().info(
+            f"Gyro bias X: "
+            f"{self.gx_bias_dps:.6f} deg/s"
+        )
+
+        self.get_logger().info(
+            f"Gyro bias Y: "
+            f"{self.gy_bias_dps:.6f} deg/s"
+        )
+
+        self.get_logger().info(
+            f"Gyro bias Z: "
+            f"{self.gz_bias_dps:.6f} deg/s"
+        )
+
+        self.get_logger().info(
+            "WT901 magnetic yaw will NOT be used."
+        )
+
+        self.get_logger().info(
+            "Yaw will be obtained by integrating "
+            "calibrated gyro-Z."
+        )
+
+        self.get_logger().info(
+            "================================================"
+        )
 
     # ========================================================
     # ROS PUBLISH
@@ -400,17 +628,159 @@ class WT901ImuNode(Node):
 
             try:
 
-                data = self.data_queue.get_nowait()
+                data = (
+                    self.data_queue.get_nowait()
+                )
 
             except queue.Empty:
 
                 break
 
-            msg = Imu()
+            # ------------------------------------------------
+            # Calibration phase
+            # ------------------------------------------------
+
+            if self.calibrating:
+
+                if not hasattr(
+                    self,
+                    "_calibration_logged"
+                ):
+
+                    self.get_logger().info(
+                        "Calibrating IMU. "
+                        "KEEP THE ROVER COMPLETELY STILL."
+                    )
+
+                    self._calibration_logged = True
+
+                self.process_calibration(
+                    data
+                )
+
+                continue
 
             # ------------------------------------------------
-            # Header
+            # Correct gyro bias
             # ------------------------------------------------
+
+            gx_dps = (
+                data.gx_dps
+                - self.gx_bias_dps
+            )
+
+            gy_dps = (
+                data.gy_dps
+                - self.gy_bias_dps
+            )
+
+            gz_dps = (
+                data.gz_dps
+                - self.gz_bias_dps
+            )
+
+            # ------------------------------------------------
+            # Low-pass gyro
+            # ------------------------------------------------
+
+            if not self.filter_initialized:
+
+                self.gx_filtered = gx_dps
+                self.gy_filtered = gy_dps
+                self.gz_filtered = gz_dps
+
+                self.filter_initialized = True
+
+            else:
+
+                self.gx_filtered = (
+                    GYRO_ALPHA * gx_dps
+                    + (1.0 - GYRO_ALPHA)
+                    * self.gx_filtered
+                )
+
+                self.gy_filtered = (
+                    GYRO_ALPHA * gy_dps
+                    + (1.0 - GYRO_ALPHA)
+                    * self.gy_filtered
+                )
+
+                self.gz_filtered = (
+                    GYRO_ALPHA * gz_dps
+                    + (1.0 - GYRO_ALPHA)
+                    * self.gz_filtered
+                )
+
+            # ------------------------------------------------
+            # Integrate gyro-Z
+            #
+            # IMPORTANT:
+            # This replaces the WT901's reported yaw.
+            # ------------------------------------------------
+
+            now = time.monotonic()
+
+            if self.last_gyro_time is None:
+
+                self.last_gyro_time = now
+
+            else:
+
+                dt = (
+                    now
+                    - self.last_gyro_time
+                )
+
+                if (
+                    dt > 0.0
+                    and dt < MAX_DT
+                ):
+
+                    self.yaw_integrated_deg += (
+                        self.gz_filtered * dt
+                    )
+
+                self.last_gyro_time = now
+
+            self.yaw_integrated_deg = (
+                normalize_angle_deg(
+                    self.yaw_integrated_deg
+                )
+            )
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            # Do NOT use data.yaw_deg here.
+            # ------------------------------------------------
+
+            relative_yaw_deg = (
+                self.yaw_integrated_deg
+            )
+
+            # ------------------------------------------------
+            # Roll + pitch:
+            # continue using WT901 AHRS values.
+            #
+            # Yaw:
+            # use integrated gyro-Z.
+            # ------------------------------------------------
+
+            (
+                qx,
+                qy,
+                qz,
+                qw,
+            ) = euler_to_quaternion(
+                data.roll_deg,
+                data.pitch_deg,
+                relative_yaw_deg,
+            )
+
+            # ------------------------------------------------
+            # ROS Imu message
+            # ------------------------------------------------
+
+            msg = Imu()
 
             msg.header.stamp = (
                 self.get_clock()
@@ -418,12 +788,15 @@ class WT901ImuNode(Node):
                 .to_msg()
             )
 
-            msg.header.frame_id = IMU_FRAME
+            msg.header.frame_id = (
+                IMU_FRAME
+            )
 
             # ------------------------------------------------
-            # Linear acceleration
-            # WT901 output is in g
-            # ROS expects m/s²
+            # Acceleration
+            #
+            # Published for completeness.
+            # Current EKF configuration does not use it.
             # ------------------------------------------------
 
             msg.linear_acceleration.x = (
@@ -439,39 +812,29 @@ class WT901ImuNode(Node):
             )
 
             # ------------------------------------------------
-            # Angular velocity
-            # WT901 output is °/s
-            # ROS expects rad/s
+            # Filtered gyro
             # ------------------------------------------------
 
-            deg_to_rad = math.pi / 180.0
+            d2r = math.pi / 180.0
 
             msg.angular_velocity.x = (
-                data.gx_dps * deg_to_rad
+                self.gx_filtered
+                * d2r
             )
 
             msg.angular_velocity.y = (
-                data.gy_dps * deg_to_rad
+                self.gy_filtered
+                * d2r
             )
 
             msg.angular_velocity.z = (
-                data.gz_dps * deg_to_rad
+                self.gz_filtered
+                * d2r
             )
 
             # ------------------------------------------------
             # Orientation
             # ------------------------------------------------
-
-            (
-                qx,
-                qy,
-                qz,
-                qw,
-            ) = euler_to_quaternion(
-                data.roll_deg,
-                data.pitch_deg,
-                data.yaw_deg,
-            )
 
             msg.orientation.x = qx
             msg.orientation.y = qy
@@ -480,19 +843,29 @@ class WT901ImuNode(Node):
 
             # ------------------------------------------------
             # Covariance
-            #
-            # We have not experimentally calibrated these
-            # yet, so leave the covariance unspecified.
             # ------------------------------------------------
 
-            msg.orientation_covariance[0] = -1.0
+            msg.orientation_covariance = [
+                0.01, 0.0, 0.0,
+                0.0, 0.01, 0.0,
+                0.0, 0.0, 0.02,
+            ]
 
-            msg.angular_velocity_covariance[0] = -1.0
+            msg.angular_velocity_covariance = [
+                0.005, 0.0, 0.0,
+                0.0, 0.005, 0.0,
+                0.0, 0.0, 0.01,
+            ]
 
-            msg.linear_acceleration_covariance[0] = -1.0
+            msg.linear_acceleration_covariance = [
+                0.20, 0.0, 0.0,
+                0.0, 0.20, 0.0,
+                0.0, 0.0, 0.20,
+            ]
 
-            self.publisher.publish(msg)
-
+            self.publisher.publish(
+                msg
+            )
 
     # ========================================================
     # CLEAN SHUTDOWN
@@ -523,13 +896,17 @@ class WT901ImuNode(Node):
 
 def main(args=None) -> None:
 
-    rclpy.init(args=args)
+    rclpy.init(
+        args=args
+    )
 
     node = WT901ImuNode()
 
     try:
 
-        rclpy.spin(node)
+        rclpy.spin(
+            node
+        )
 
     except KeyboardInterrupt:
 
@@ -540,9 +917,6 @@ def main(args=None) -> None:
         node.shutdown()
 
         node.destroy_node()
-
-        # rclpy may already be shutting down after SIGINT.
-        # Only call shutdown if the context is still active.
 
         if rclpy.ok():
 
